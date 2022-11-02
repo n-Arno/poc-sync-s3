@@ -1,0 +1,175 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sync-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: add-labeler
+  namespace: sync-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-add-label
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-add-label-binding
+subjects:
+  - kind: ServiceAccount
+    name: add-labeler
+    namespace: sync-system
+roleRef:
+  kind: ClusterRole
+  name: node-add-label
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-config
+  namespace: sync-system
+stringData:
+  rclone.conf: |
+    [scaleway]
+    type = s3
+    provider = Scaleway
+    access_key_id = <ACCESS_KEY>
+    secret_access_key = <SECRET_KEY>
+    region = fr-par
+    endpoint = s3.fr-par.scw.cloud
+    acl = private
+    storage_class = STANDARD
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sync-ds
+  namespace: sync-system
+  labels:
+    app: sync-s3
+spec:
+  selector:
+    matchLabels:
+      app: sync-s3
+  template:
+    metadata:
+      labels: 
+        app: sync-s3
+    spec:
+      serviceAccountName: add-labeler
+      initContainers:
+      - name: init-sync
+        image: rg.fr-par.scw.cloud/<registry-name>/sync:latest
+        command:
+        - /bin/ash
+        - -c
+        - rclone sync scaleway:<source-bucket> /data/s3 && kubectl label nodes --overwrite=true $KUBERNETES_NODE_NAME sync-date=$(date "+%F-%H-%M-%S")
+        volumeMounts:
+        - name: sync-folder
+          mountPath: /data/s3
+        - name: s3-config
+          mountPath: /root/.config/rclone/
+        env:
+        - name: KUBERNETES_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      containers:
+      - name: sync
+        image: rg.fr-par.scw.cloud/<registry-name>/sync:latest
+        command:
+        - /bin/ash
+        - -c
+        - while true; do sleep 3600; rclone sync scaleway:<source-bucket> /data/s3 && kubectl label nodes --overwrite=true $KUBERNETES_NODE_NAME sync-date=$(date "+%F-%H-%M-%S"); done
+        volumeMounts:
+        - name: sync-folder
+          mountPath: /data/s3
+        - name: s3-config
+          mountPath: /root/.config/rclone/
+        env:
+        - name: KUBERNETES_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      volumes:
+      - name: sync-folder
+        hostPath:
+          path: /data/s3
+          type: DirectoryOrCreate
+      - name: s3-config
+        secret:
+          secretName: s3-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: default
+data:
+  default.conf: |
+    server {
+        listen       80;
+        server_name  localhost;
+        location / {
+            autoindex on;
+            root   /data/s3;
+        }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-usage
+  namespace: default
+  labels:
+    app: demo-usage
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: sync-date
+            operator: Exists
+  containers:
+  - name: demo-usage
+    image: nginx:alpine
+    volumeMounts:
+    - name: sync-folder
+      mountPath: /data/s3
+      readOnly: true
+    - name: nginx-config
+      mountPath: /etc/nginx/conf.d/
+  volumes:
+  - name: sync-folder
+    hostPath:
+      path: /data/s3
+      type: Directory
+  - name: nginx-config
+    configMap:
+      name: nginx-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: demo-usage
+  name: demo-usage
+  namespace: default
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: demo-usage
+  type: LoadBalancer
